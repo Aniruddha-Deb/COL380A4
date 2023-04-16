@@ -1,27 +1,14 @@
 #include "sparsemat.hpp"
 #include <cuda_runtime.h>
 #include <cassert>
-
-#define idx(i,j) (((idx_t)(i))<<32 | (j));
-#define idx_i(idx) (int((idx)>>32));
-#define idx_j(idx) (int(idx));
-
-// taken from the NVIDIA CUDA examples
-#define checkCudaErrors(call)                                 \
-  do {                                                        \
-    cudaError_t err = call;                                   \
-    if (err != cudaSuccess) {                                 \
-      printf("CUDA error at %s %d: %s\n", __FILE__, __LINE__, \
-             cudaGetErrorString(err));                        \
-      exit(EXIT_FAILURE);                                     \
-    }                                                         \
-  } while (0)
+#include <iostream>
 
 // sparse matrix multiplication C = A * B on the device 
 // A is BCSR while B is BCSC
 template <int m> __global__
-void sparse_mul_cuda(uint32_t *A_data, uint32_t *B_data, uint32_t* C_data, uint8_t* C_valid;
-        int *A_idxs, int *B_idxs, int *A_idxmap, int *B_idxmap, int n) {
+void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs, 
+        uint32_t *B_data, int *B_idxs, int *B_idxptrs, uint32_t* C_data, 
+        uint8_t* C_valid, int n) {
 
 
     // this block multiplies C(bx, by) <- sum_i A(bx, i) * B(i, by)
@@ -31,7 +18,7 @@ void sparse_mul_cuda(uint32_t *A_data, uint32_t *B_data, uint32_t* C_data, uint8
     int ty = threadIdx.y;
 
     // just return if there's nothing to do
-    if (A_idxmap[bx] == A_idxmap[bx+1] && B_idxmap[by] == B_idxmap[by+1]) return;
+    if (A_idxptrs[bx] == A_idxptrs[bx+1] && B_idxptrs[by] == B_idxptrs[by+1]) return;
 
     __shared__ uint32_t A_buf[m][m];
     __shared__ uint32_t B_buf[m][m];
@@ -40,24 +27,24 @@ void sparse_mul_cuda(uint32_t *A_data, uint32_t *B_data, uint32_t* C_data, uint8
     // use a two-pointer algorithm to find out which matrices to multiply first
     // invariants: 
     //     A_idxs[Ap] <= B_idxs[Bp]
-    //     A_idxmap[bx] <= Ap < A_idxmap[bx+1]
-    //     B_idxmap[by] <= Bp < B_idxmap[by+1]
-    int Ap = A_idxmap[bx];
-    int Bp = B_idxmap[by];
+    //     A_idxptrs[bx] <= Ap < A_idxptrs[bx+1]
+    //     B_idxptrs[by] <= Bp < B_idxptrs[by+1]
+    int Ap = A_idxptrs[bx];
+    int Bp = B_idxptrs[by];
 
     uint8_t multiplied = 0;
-    for (; Bp < B_idxmap[by+1]; Bp++) {
+    for (; Bp < B_idxptrs[by+1]; Bp++) {
 
-        while (A_idxs[Ap] < B_idxs[Bp] && Ap < A_idxmap[bx+1]) Ap++;
-        if (Ap >= A_idxmap[bx+1]) break;
+        while (A_idxs[Ap] < B_idxs[Bp] && Ap < A_idxptrs[bx+1]) Ap++;
+        if (Ap >= A_idxptrs[bx+1]) break;
         if (A_idxs[Ap] > B_idxs[Bp]) continue;
 
         // all invariants are satisfied here, so we can multiply
         multiplied = 1;
 
         // load into A_buf and B_buf 
-        A_buf[tx][ty] = A_data[A_idxmap[Ap]*m*m + tx*m + ty]
-        B_buf[tx][ty] = B_data[B_idxmap[Bp]*m*m + tx*m + ty]
+        A_buf[tx][ty] = A_data[A_idxptrs[Ap]*m*m + tx*m + ty]
+        B_buf[tx][ty] = B_data[B_idxptrs[Bp]*m*m + tx*m + ty]
         __syncthreads();
 
         // Do the multiplication
@@ -76,7 +63,8 @@ void sparse_mul_cuda(uint32_t *A_data, uint32_t *B_data, uint32_t* C_data, uint8
     C_data[(bx*m + tx)*n + by*m + ty] = C_buf[tx][ty];
 }
 
-SparseMatrix* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
+//CSRMatrix* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
+uint32_t* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
 
     // allocate device memory
 
@@ -113,32 +101,104 @@ SparseMatrix* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
     // get 12GB of device memory when we're running, so cudaMallocManaged 
     // shouldn't be an issue...
 
-    uint32_t* d_A_data, d_B_data;
-    uint32_t* d_A_idxs, d_B_idxs;
+    uint32_t* d_A_data,    d_B_data;
+    uint32_t* d_A_idxs,    d_B_idxs;
     uint32_t* d_A_idxptrs, d_B_idxptrs;
 
     uint32_t* d_C_data;
-    uint8_t* d_C_valid;
+    uint8_t*  d_C_valid;
+    uint32_t* h_C_data;
+    uint8_t*  h_C_valid;
 
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_A_data), A->k*A->m*A->m*sizeof(uint32_t)));
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_A_idxs), A->k*sizeof(int)));
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_A_idxptrs), (A->k+1)*sizeof(int)));
 
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_B_data), B->k*B->m*B->m*sizeof(uint32_t)));
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_B_idxs), B->k*sizeof(int)));
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_B_idxptrs), (B->k+1)*sizeof(int)));
+    // create streams
+    cudaStream_t stream;
+    checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_data), A->n*A->n*sizeof(uint32_t)));
+    // TODO see how multiple streams work
+    // cudaStream_t A_data_stream, A_idxs_stream, A_idxptrs_stream;
+    // cudaStream_t B_data_stream, B_idxs_stream, B_idxptrs_stream;
+    // checkCudaErrors(cudaStreamCreateWithFlags(A_data_stream, cudaStreamNonBlocking));
+    // checkCudaErrors(cudaStreamCreateWithFlags(A_idxs_stream, cudaStreamNonBlocking));
+    // checkCudaErrors(cudaStreamCreateWithFlags(A_idxptrs_stream, cudaStreamNonBlocking));
+    // checkCudaErrors(cudaStreamCreateWithFlags(B_data_stream, cudaStreamNonBlocking));
+    // checkCudaErrors(cudaStreamCreateWithFlags(B_idxs_stream, cudaStreamNonBlocking));
+    // checkCudaErrors(cudaStreamCreateWithFlags(B_idxptrs_stream, cudaStreamNonBlocking));
+
+    // stream memory out
+    // why don't we just allocate these things on the device itself!!!
+    // let's not prematurely optimize... There's no way to interlace the reads
+    // and device writes, so it doesn't make a difference when we do the data 
+    // transfer...
+    checkCudaErrors(cudaMemcpyAsync(d_A_idxptrs, A->idxptrs, A->p+1, cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_A_idxs,    A->idxs,    A->k, cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_A_data,    A->data,    A->k*A->m*A->m, cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_B_idxptrs, B->idxptrs, B->p+1, cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_B_idxs,    B->idxs,    B->k, cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_B_data,    B->data,    B->k*B->m*B->m, cudaMemcpyHostToDevice, stream));
+
+    // initialize C matrix on device
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_data),  A->n*A->n*sizeof(uint32_t)));
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_valid), A->n*A->n*sizeof(uint8_t)));
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_data),  A->n*A->n*sizeof(uint32_t)));
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_valid), A->n*A->n*sizeof(uint8_t)));
+    checkCudaErrors(cudaMemset(reinterpret_cast<void**>(&d_C_valid), 0, A->n*A->n*sizeof(uint8_t)));
+    // JUST WHILE TESTING!
+    checkCudaErrors(cudaMemset(reinterpret_cast<void**>(&d_C_data), 0, A->n*A->n*sizeof(uint32_t)));
 
-    // should we stream the memory instead? The device accesses the memory only once...
+    // assuming A->m = B->m = m
+    int p = A->p;
+    int m = A->m;
+    dim3 threads(m, m);
+    dim3 grid(p, p);
 
-    cudaMalloc(
+    // now multiply the stuff out
+    if (A->m == 4) {
+        sparse_mul_cuda<4><<<grid, threads, 0, stream>>>(
+            d_A_data, d_A_idxs, d_A_idxptrs, d_B_data, d_B_idxs, d_B_idxptrs,
+            d_C_data, d_C_valid, n
+        );
+    }
+    else {
+        sparse_mul_cuda<8><<<grid, threads, 0, stream>>>(
+            d_A_data, d_A_idxs, d_A_idxptrs, d_B_data, d_B_idxs, d_B_idxptrs,
+            d_C_data, d_C_valid, n
+        );
+    }
+
+    // TODO compress the C matrix into CSR format
+    // for now, we can just copy it over
+    checkCudaErrors(cudaMemcpyAsync(d_C_data, h_C_data, n*n*sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_C_valid, h_C_valid, n*n*sizeof(uint8_t), cudaMemcpyDeviceToHost, stream));
+
+    checkCudaErrors(cudaStreamSynchronize(stream));
+
+    checkCudaErrors(cudaFree(d_A_idxptrs));
+    checkCudaErrors(cudaFree(d_A_idxs));
+    checkCudaErrors(cudaFree(d_A_data));
+    checkCudaErrors(cudaFree(d_B_idxptrs));
+    checkCudaErrors(cudaFree(d_B_idxs));
+    checkCudaErrors(cudaFree(d_B_data));
+    checkCudaErrors(cudaFree(d_C_data));
+    checkCudaErrors(cudaFree(d_C_valid));
+    checkCudaErrors(cudaFreeHost(h_C_valid));
+
+    return h_C_data
 }
 
 int main(int argc, char** argv) {
 
-    
+    CSRMatrix* A = new CSRMatrix();
+    CSRMatrix* B = new CSRMatrix();
+
+    uint32_t* C_data = sparse_matrix_multiply(A, B);
+
+    for (int i=0; i<n; i++) {
+        for (int j=0; j<n; j++) {
+            std::cout << C_data[n*i+j] << " ";
+        }
+        std::cout << "\n";
+    }
 
     return 0;
 }

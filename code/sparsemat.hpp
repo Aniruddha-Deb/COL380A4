@@ -1,3 +1,5 @@
+#pragma once
+
 #include <fstream>
 #include <iostream>
 #include <cstring>
@@ -14,6 +16,7 @@ struct BCSMatrix {
     int n;
     int m;
     int k;
+    int p;
     CompressionType ct;
 
     int *idxptrs;

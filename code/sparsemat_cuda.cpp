@@ -5,15 +5,15 @@
 #include <cassert>
 
 void __alloc_mem() {
-    idxptrs = new int[p+1]();
-    idxs = new int[k]();
-    data = new uint32_t[k*m*m]();
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&idxptrs), (p+1)*sizeof(int)));
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&idxs), (k)*sizeof(int)));
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&data), (k*m*m)*sizeof(int)));
 }
 
 void __free_mem() {
-    delete data;
-    delete idxs; 
-    delete idxptrs;
+    checkCudaErrors(cudaFreeHost(reinterpret_cast<void**>(&idxptrs)));
+    checkCudaErrors(cudaFreeHost(reinterpret_cast<void**>(&idxs)));
+    checkCudaErrors(cudaFreeHost(reinterpret_cast<void**>(&data)));
 }
 
 BCSMatrix::BCSMatrix(int _n, int _m, int _k, CompressionType _ct) {
