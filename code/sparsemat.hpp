@@ -33,6 +33,9 @@ struct BCSMatrix {
     void save(char* filename);
 
     ~BCSMatrix();
+
+    void __alloc_mem();
+    void __free_mem();
 };
 
 struct CudaSparseMatrix {

@@ -1,16 +1,18 @@
 #include "sparsemat.hpp"
+#include "cuda_utils.hpp"
+#include <cuda_runtime.h>
 #include <cstring>
 #include <fstream>
 #include <vector>
 #include <cassert>
 
-void __alloc_mem() {
+void BCSMatrix::__alloc_mem() {
     checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&idxptrs), (p+1)*sizeof(int)));
     checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&idxs), (k)*sizeof(int)));
-    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&data), (k*m*m)*sizeof(int)));
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&data), (k*m*m)*sizeof(uint32_t)));
 }
 
-void __free_mem() {
+void BCSMatrix::__free_mem() {
     checkCudaErrors(cudaFreeHost(reinterpret_cast<void**>(&idxptrs)));
     checkCudaErrors(cudaFreeHost(reinterpret_cast<void**>(&idxs)));
     checkCudaErrors(cudaFreeHost(reinterpret_cast<void**>(&data)));
@@ -177,5 +179,5 @@ void BCSMatrix::save(char* filename) {
 }
 
 BCSMatrix::~BCSMatrix() {
-    __free_mem()
+    __free_mem();
 }

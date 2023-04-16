@@ -1,14 +1,17 @@
 #include "sparsemat.hpp"
+#include "cuda_utils.hpp"
 #include <cuda_runtime.h>
 #include <cassert>
 #include <iostream>
+// #include <helper_cuda.h>
+// #include <helper_functions.h>
 
 // sparse matrix multiplication C = A * B on the device 
 // A is BCSR while B is BCSC
 template <int m> __global__
 void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs, 
-        uint32_t *B_data, int *B_idxs, int *B_idxptrs, uint32_t* C_data, 
-        uint8_t* C_valid, int n) {
+        uint32_t *B_data, int *B_idxs, int *B_idxptrs, 
+        uint32_t* C_data, uint8_t* C_valid, int n) {
 
 
     // this block multiplies C(bx, by) <- sum_i A(bx, i) * B(i, by)
@@ -22,7 +25,7 @@ void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs,
 
     __shared__ uint32_t A_buf[m][m];
     __shared__ uint32_t B_buf[m][m];
-    __shared__ uint32_t C_buf[m][m]();
+    __shared__ uint32_t C_buf[m][m];
 
     // use a two-pointer algorithm to find out which matrices to multiply first
     // invariants: 
@@ -43,14 +46,14 @@ void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs,
         multiplied = 1;
 
         // load into A_buf and B_buf 
-        A_buf[tx][ty] = A_data[A_idxptrs[Ap]*m*m + tx*m + ty]
-        B_buf[tx][ty] = B_data[B_idxptrs[Bp]*m*m + tx*m + ty]
+        A_buf[tx][ty] = A_data[A_idxptrs[Ap]*m*m + tx*m + ty];
+        B_buf[tx][ty] = B_data[B_idxptrs[Bp]*m*m + tx*m + ty];
         __syncthreads();
 
         // Do the multiplication
         #pragma unroll
         for (int i=0; i<m; i++) {
-            C_buf[tx][ty] += As[tx][i] * Bs[k][ty];
+            C_buf[tx][ty] += A_buf[tx][i] * B_buf[i][ty];
             // TODO add clipping here?
         }
         __syncthreads();
@@ -63,8 +66,8 @@ void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs,
     C_data[(bx*m + tx)*n + by*m + ty] = C_buf[tx][ty];
 }
 
-//CSRMatrix* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
-uint32_t* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
+//BCSMatrix* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
+uint32_t* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
 
     // allocate device memory
 
@@ -101,9 +104,9 @@ uint32_t* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
     // get 12GB of device memory when we're running, so cudaMallocManaged 
     // shouldn't be an issue...
 
-    uint32_t* d_A_data,    d_B_data;
-    uint32_t* d_A_idxs,    d_B_idxs;
-    uint32_t* d_A_idxptrs, d_B_idxptrs;
+    uint32_t *d_A_data,    *d_B_data;
+    int *d_A_idxs,    *d_B_idxs;
+    int *d_A_idxptrs, *d_B_idxptrs;
 
     uint32_t* d_C_data;
     uint8_t*  d_C_valid;
@@ -130,25 +133,35 @@ uint32_t* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
     // let's not prematurely optimize... There's no way to interlace the reads
     // and device writes, so it doesn't make a difference when we do the data 
     // transfer...
-    checkCudaErrors(cudaMemcpyAsync(d_A_idxptrs, A->idxptrs, A->p+1, cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_A_idxs,    A->idxs,    A->k, cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_A_data,    A->data,    A->k*A->m*A->m, cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_B_idxptrs, B->idxptrs, B->p+1, cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_B_idxs,    B->idxs,    B->k, cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_B_data,    B->data,    B->k*B->m*B->m, cudaMemcpyHostToDevice, stream));
-
-    // initialize C matrix on device
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_data),  A->n*A->n*sizeof(uint32_t)));
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_valid), A->n*A->n*sizeof(uint8_t)));
-    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_data),  A->n*A->n*sizeof(uint32_t)));
-    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_valid), A->n*A->n*sizeof(uint8_t)));
-    checkCudaErrors(cudaMemset(reinterpret_cast<void**>(&d_C_valid), 0, A->n*A->n*sizeof(uint8_t)));
-    // JUST WHILE TESTING!
-    checkCudaErrors(cudaMemset(reinterpret_cast<void**>(&d_C_data), 0, A->n*A->n*sizeof(uint32_t)));
 
     // assuming A->m = B->m = m
     int p = A->p;
     int m = A->m;
+    int n = A->n;
+
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_A_idxptrs), sizeof(int)*(A->p+1)));
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_A_idxs),    sizeof(int)*A->k));
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_A_data),    sizeof(uint32_t)*A->k*A->m*A->m));
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_B_idxptrs), sizeof(int)*(B->p+1)));
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_B_idxs),    sizeof(int)*B->k));
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_B_data),    sizeof(uint32_t)*B->k*B->m*B->m));
+
+    checkCudaErrors(cudaMemcpyAsync(d_A_idxptrs, A->idxptrs, sizeof(int)*(A->p+1), cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_A_idxs,    A->idxs,    sizeof(int)*A->k, cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_A_data,    A->data,    sizeof(uint32_t)*A->k*A->m*A->m, cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_B_idxptrs, B->idxptrs, sizeof(int)*(B->p+1), cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_B_idxs,    B->idxs,    sizeof(int)*B->k, cudaMemcpyHostToDevice, stream));
+    checkCudaErrors(cudaMemcpyAsync(d_B_data,    B->data,    sizeof(uint32_t)*B->k*B->m*B->m, cudaMemcpyHostToDevice, stream));
+
+    // initialize C matrix on device
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_data),  n*n*sizeof(uint32_t)));
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_valid), n*n*sizeof(uint8_t)));
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_data),  n*n*sizeof(uint32_t)));
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_valid), n*n*sizeof(uint8_t)));
+    checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_valid), 0, n*n*sizeof(uint8_t)));
+    // JUST WHILE TESTING!
+    checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_data), 0, n*n*sizeof(uint32_t)));
+
     dim3 threads(m, m);
     dim3 grid(p, p);
 
@@ -165,6 +178,8 @@ uint32_t* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
             d_C_data, d_C_valid, n
         );
     }
+
+    checkCudaErrors(cudaStreamSynchronize(stream));
 
     // TODO compress the C matrix into CSR format
     // for now, we can just copy it over
@@ -183,16 +198,17 @@ uint32_t* sparse_matrix_multiply(CSRMatrix *A, CSRMatrix *B) {
     checkCudaErrors(cudaFree(d_C_valid));
     checkCudaErrors(cudaFreeHost(h_C_valid));
 
-    return h_C_data
+    return h_C_data;
 }
 
 int main(int argc, char** argv) {
 
-    CSRMatrix* A = new CSRMatrix();
-    CSRMatrix* B = new CSRMatrix();
+    BCSMatrix* A = new BCSMatrix();
+    BCSMatrix* B = new BCSMatrix();
 
     uint32_t* C_data = sparse_matrix_multiply(A, B);
 
+    int n = A->n;
     for (int i=0; i<n; i++) {
         for (int j=0; j<n; j++) {
             std::cout << C_data[n*i+j] << " ";
