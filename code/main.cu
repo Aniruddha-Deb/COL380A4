@@ -2,6 +2,7 @@
 #include "cuda_utils.hpp"
 #include <cuda_runtime.h>
 #include <cassert>
+#include <cstdio>
 #include <iostream>
 // #include <helper_cuda.h>
 // #include <helper_functions.h>
@@ -26,6 +27,8 @@ void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs,
     __shared__ uint32_t A_buf[m][m];
     __shared__ uint32_t B_buf[m][m];
     __shared__ uint32_t C_buf[m][m];
+
+    C_buf[tx][ty] = 0;
 
     // use a two-pointer algorithm to find out which matrices to multiply first
     // invariants: 
@@ -61,9 +64,17 @@ void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs,
 
     if (!multiplied) return;
 
+    // for (int i=0; i<m; i++) {
+    //     for (int j=0; j<m; j++) {
+    //         printf("%d ", C_buf[i][j]);
+    //     }
+    //     printf("\n");
+    // }
+
     // copy C_buf to C_data: each thread copies one element
     C_valid[bx*m + by] = 1;
     C_data[(bx*m + tx)*n + by*m + ty] = C_buf[tx][ty];
+    __syncthreads();
 }
 
 //BCSMatrix* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
@@ -155,15 +166,17 @@ uint32_t* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
 
     // initialize C matrix on device
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_data),  n*n*sizeof(uint32_t)));
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_valid), n*n*sizeof(uint8_t)));
+    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_valid), p*p*sizeof(uint8_t)));
     checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_data),  n*n*sizeof(uint32_t)));
-    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_valid), n*n*sizeof(uint8_t)));
-    checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_valid), 0, n*n*sizeof(uint8_t)));
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_valid), p*p*sizeof(uint8_t)));
     // JUST WHILE TESTING!
     checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_data), 0, n*n*sizeof(uint32_t)));
+    checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_valid), 0, p*p*sizeof(uint8_t)));
 
     dim3 threads(m, m);
     dim3 grid(p, p);
+
+    // checkCudaErrors(cudaStreamSynchronize(stream));
 
     // now multiply the stuff out
     if (A->m == 4) {
@@ -183,10 +196,17 @@ uint32_t* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
 
     // TODO compress the C matrix into CSR format
     // for now, we can just copy it over
-    checkCudaErrors(cudaMemcpyAsync(d_C_data, h_C_data, n*n*sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_C_valid, h_C_valid, n*n*sizeof(uint8_t), cudaMemcpyDeviceToHost, stream));
+    checkCudaErrors(cudaMemcpyAsync(h_C_data,  d_C_data,  n*n*sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    checkCudaErrors(cudaMemcpyAsync(h_C_valid, d_C_valid, p*p*sizeof(uint8_t), cudaMemcpyDeviceToHost, stream));
 
     checkCudaErrors(cudaStreamSynchronize(stream));
+
+    for (int i=0; i<p; i++) {
+        for (int j=0; j<p; j++) {
+            std::cout << int(h_C_valid[p*i+j]) << " ";
+        }
+        std::cout << "\n";
+    }
 
     checkCudaErrors(cudaFree(d_A_idxptrs));
     checkCudaErrors(cudaFree(d_A_idxs));
@@ -196,15 +216,20 @@ uint32_t* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
     checkCudaErrors(cudaFree(d_B_data));
     checkCudaErrors(cudaFree(d_C_data));
     checkCudaErrors(cudaFree(d_C_valid));
-    checkCudaErrors(cudaFreeHost(h_C_valid));
+    // checkCudaErrors(cudaFreeHost(h_C_valid));
 
     return h_C_data;
 }
 
 int main(int argc, char** argv) {
 
-    BCSMatrix* A = new BCSMatrix();
-    BCSMatrix* B = new BCSMatrix();
+    BCSMatrix* A = new BCSMatrix(argv[1], CT_ROW);
+    BCSMatrix* B = new BCSMatrix(argv[2], CT_COL);
+
+    A->dense_print();
+    std::cout << '\n';
+    B->dense_print();
+    std::cout << '\n';
 
     uint32_t* C_data = sparse_matrix_multiply(A, B);
 
@@ -215,6 +240,7 @@ int main(int argc, char** argv) {
         }
         std::cout << "\n";
     }
+    checkCudaErrors(cudaFreeHost(C_data));
 
     return 0;
 }
