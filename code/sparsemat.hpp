@@ -5,50 +5,43 @@
 
 using idx_t = uint64_t;
 
-struct CSRMatrix {
-    int n;
-    int m;
-    int k;
-    int *I;
-    int *J;
-    // ASSUMPTION unsigned for now
-    uint32_t **M;
-
-    SparseMatrix(int _n, int _m, int _k); 
-    SparseMatrix(char* filename); 
-
-    void print();
-
-    void save(char* filename, int nbytes);
-
-    ~SparseMatrix();
+enum CompressionType {
+    CT_ROW, CT_COL
 };
 
-struct CSCMatrix {
-
+// https://matteding.github.io/2019/04/25/sparse-matrices/#compressed-sparse-rowcolumn
+struct BCSMatrix {
     int n;
     int m;
     int k;
+    CompressionType ct;
 
-    int *idx;
-    int 
+    int *idxptrs;
+    int *idxs;
+    uint32_t *data;
 
-struct CUDASparseMatrix {
-    int n;
-    int m;
-    int k;
-    int *I;
-    int *J;
-    // ASSUMPTION unsigned for now
-    uint32_t **M;
+    BCSMatrix(int _n, int _m, int _k, CompressionType _ct); 
+    BCSMatrix(char* filename, CompressionType _ct); 
+    BCSMatrix(); 
 
-    SparseMatrix(int _n, int _m, int _k); 
-    SparseMatrix(char* filename); 
-
+    void dense_print();
     void print();
 
-    void save(char* filename, int nbytes);
+    void save(char* filename);
 
-    ~SparseMatrix();
+    ~BCSMatrix();
 };
 
+struct CudaSparseMatrix {
+
+    int n;
+    int m;
+    int k;
+    CompressionType ct;
+
+    uint32_t* data;
+    uint8_t* valid;
+
+    CudaSparseMatrix(int _n, int _m);
+    ~CudaSparseMatrix();
+};
