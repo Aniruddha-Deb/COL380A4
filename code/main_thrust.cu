@@ -76,7 +76,6 @@ void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs,
     // copy C_buf to C_data: each thread copies one element
     C_valid[bx*m + by] = 1;
     C_data[(bx*m + tx)*n + by*m + ty] = C_buf[tx][ty];
-    __syncthreads();
 }
 
 // thrust functor for coordinate transformations
@@ -140,40 +139,19 @@ uint32_t* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
     // get 12GB of device memory when we're running, so cudaMallocManaged 
     // shouldn't be an issue...
 
+    int n = A->n;
+    int m = A->m;
+    int p = A->p;
+    thrust::device_vector<uint32_t> C_data(n*n);
+    thrust::device_vector<uint8_t> C_valid(p*p, 0);
+
     uint32_t *d_A_data,    *d_B_data;
     int *d_A_idxs,    *d_B_idxs;
     int *d_A_idxptrs, *d_B_idxptrs;
 
-    uint32_t* d_C_data;
-    uint8_t*  d_C_valid;
-    uint32_t* h_C_data;
-    uint8_t*  h_C_valid;
-
-
     // create streams
     cudaStream_t stream;
     checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-    // TODO see how multiple streams work
-    // cudaStream_t A_data_stream, A_idxs_stream, A_idxptrs_stream;
-    // cudaStream_t B_data_stream, B_idxs_stream, B_idxptrs_stream;
-    // checkCudaErrors(cudaStreamCreateWithFlags(A_data_stream, cudaStreamNonBlocking));
-    // checkCudaErrors(cudaStreamCreateWithFlags(A_idxs_stream, cudaStreamNonBlocking));
-    // checkCudaErrors(cudaStreamCreateWithFlags(A_idxptrs_stream, cudaStreamNonBlocking));
-    // checkCudaErrors(cudaStreamCreateWithFlags(B_data_stream, cudaStreamNonBlocking));
-    // checkCudaErrors(cudaStreamCreateWithFlags(B_idxs_stream, cudaStreamNonBlocking));
-    // checkCudaErrors(cudaStreamCreateWithFlags(B_idxptrs_stream, cudaStreamNonBlocking));
-
-    // stream memory out
-    // why don't we just allocate these things on the device itself!!!
-    // let's not prematurely optimize... There's no way to interlace the reads
-    // and device writes, so it doesn't make a difference when we do the data 
-    // transfer...
-
-    // assuming A->m = B->m = m
-    int p = A->p;
-    int m = A->m;
-    int n = A->n;
 
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_A_idxptrs), sizeof(int)*(A->p+1)));
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_A_idxs),    sizeof(int)*A->k));
@@ -189,15 +167,6 @@ uint32_t* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
     checkCudaErrors(cudaMemcpyAsync(d_B_idxs,    B->idxs,    sizeof(int)*B->k, cudaMemcpyHostToDevice, stream));
     checkCudaErrors(cudaMemcpyAsync(d_B_data,    B->data,    sizeof(uint32_t)*B->k*B->m*B->m, cudaMemcpyHostToDevice, stream));
 
-    // initialize C matrix on device
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_data),  n*n*sizeof(uint32_t)));
-    checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_valid), p*p*sizeof(uint8_t)));
-    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_data),  n*n*sizeof(uint32_t)));
-    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_valid), p*p*sizeof(uint8_t)));
-    // JUST WHILE TESTING!
-    checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_data), 0, n*n*sizeof(uint32_t)));
-    checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_valid), 0, p*p*sizeof(uint8_t)));
-
     dim3 threads(m, m);
     dim3 grid(p, p);
 
@@ -207,43 +176,36 @@ uint32_t* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
     if (A->m == 4) {
         sparse_mul_cuda<4><<<grid, threads, 0, stream>>>(
             d_A_data, d_A_idxs, d_A_idxptrs, d_B_data, d_B_idxs, d_B_idxptrs,
-            d_C_data, d_C_valid, n
+            C_data.data(), C_valid.data(), n
         );
     }
     else {
         sparse_mul_cuda<8><<<grid, threads, 0, stream>>>(
             d_A_data, d_A_idxs, d_A_idxptrs, d_B_data, d_B_idxs, d_B_idxptrs,
-            d_C_data, d_C_valid, n
+            C_data.data(), C_valid.data(), n
         );
     }
 
     checkCudaErrors(cudaStreamSynchronize(stream));
 
-    // first, reduce the idx matrix row-wise
-    // then reduce it column 
+    // this is slow, slower than if we do it row-wise imo...
+    int n_blocks = thrust::reduce(C_valid.begin(), C_valid.end());
+    thrust::host_vector<int> idxs(n_blocks);
+    thrust::copy_if(thrust::make_counting_iterator<int>(0),
+                    thrust::make_counting_iterator<int>(n_blocks),
+                    C_valid.begin(),
+                    idxs.begin(),
+                    _1 == 1)
 
-    // reduce the d_C_valid matrix now to get the number of nonzero blocks
-    // overall...
-    
-    // thrust::transform_iterator<idx_to_row> 
+    thrust::host_vector<uint32_t> final_data(n_blocks*m*m);
+    thrust::gather(idxs.begin(), idxs.end(), C_data.begin(), C_
 
-    // thrust::device_ptr<uint8_t> d_C_valid_start(d_C_valid);
-    // thrust::device_ptr<uint8_t> d_C_valid_end(d_C_valid+p*p);
-    // int n_blocks = thrust::reduce(d_C_valid_start, d_C_valid_end);
+    thrust::host_vector<int> rows(n_blocks);
+    thrust::device_vector<int> cols(n_blocks);
 
-    // uint32_t *d_C_rows, *d_C_cols;
-    // checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_rows), sizeof(uint32_t)*n_blocks);
-    // checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_cols), sizeof(uint32_t)*n_blocks);
+    // compress
 
-    // thrust::device_ptr<uint8_t> d_C_rows_start(d_C_rows);
-    // auto row_ti = thrust::make_transform_iterator(d_C_rows_start, idx_to_row(p));
-    // thrust::device_ptr<uint8_t> d_C_cols_start(d_C_cols);
-    // auto row_ti = thrust::make_transform_iterator(d_C_rows_start, idx_to_row(p));
 
-    // copy_if(make_counting_iterator<int>(0),
-    //         make_counting_iterator<int>(n_blocks),
-    //         d_C_valid_start,
-    //         d_C_rows_start,
 
     // TODO compress the C matrix into CSR format
     // for now, we can just copy it over
