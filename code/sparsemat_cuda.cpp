@@ -13,9 +13,9 @@ void BCSMatrix::__alloc_mem() {
 }
 
 void BCSMatrix::__free_mem() {
-    checkCudaErrors(cudaFreeHost(reinterpret_cast<void**>(&idxptrs)));
-    checkCudaErrors(cudaFreeHost(reinterpret_cast<void**>(&idxs)));
-    checkCudaErrors(cudaFreeHost(reinterpret_cast<void**>(&data)));
+    checkCudaErrors(cudaFreeHost(idxptrs));
+    checkCudaErrors(cudaFreeHost(idxs));
+    checkCudaErrors(cudaFreeHost(data));
 }
 
 BCSMatrix::BCSMatrix(int _n, int _m, int _k, CompressionType _ct) {
@@ -27,7 +27,7 @@ BCSMatrix::BCSMatrix(int _n, int _m, int _k, CompressionType _ct) {
     p = n/m;
     ct = _ct;
 
-    __alloc_mem();
+    // __alloc_mem();
 }
 
 BCSMatrix::BCSMatrix(char* filename, CompressionType _ct) {
@@ -62,7 +62,6 @@ BCSMatrix::BCSMatrix(char* filename, CompressionType _ct) {
         }
     }
 
-    data = new uint32_t[k*m*m];
     for (int i=0; i<p; i++) {
         idxptrs[i+1] = idxptrs[i];
         for (auto [subidx, submat] : submats[i]) {
