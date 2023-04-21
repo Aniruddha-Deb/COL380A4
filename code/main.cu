@@ -9,14 +9,14 @@
 // #include <helper_cuda.h>
 // #include <helper_functions.h>
 
-__device__ int n_C_blocks;
+__device__ uint32_t MAX = ~0;
 
 // sparse matrix multiplication C = A * B on the device 
 // A is BCSR while B is BCSC
 template <int m> __global__
 void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs, 
         uint32_t *B_data, int *B_idxs, int *B_idxptrs, 
-        uint32_t* C_data, uint8_t* C_valid, int n) {
+        uint32_t* C_data, uint8_t* C_valid, int n, int p) {
 
 
     // this block multiplies C(bx, by) <- sum_i A(bx, i) * B(i, by)
@@ -26,11 +26,11 @@ void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs,
     int ty = threadIdx.y;
 
     // just return if there's nothing to do
-    if (A_idxptrs[bx] == A_idxptrs[bx+1] && B_idxptrs[by] == B_idxptrs[by+1]) return;
+    if (A_idxptrs[bx] == A_idxptrs[bx+1] || B_idxptrs[by] == B_idxptrs[by+1]) return;
 
     __shared__ uint32_t A_buf[m][m];
     __shared__ uint32_t B_buf[m][m];
-    __shared__ uint32_t C_buf[m][m];
+    __shared__ uint64_t C_buf[m][m];
 
     C_buf[tx][ty] = 0;
 
@@ -53,17 +53,15 @@ void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs,
         multiplied = 1;
 
         // load into A_buf and B_buf 
-        A_buf[tx][ty] = A_data[A_idxptrs[Ap]*m*m + tx*m + ty];
-        B_buf[tx][ty] = B_data[B_idxptrs[Bp]*m*m + tx*m + ty];
-        __syncthreads();
+        A_buf[tx][ty] = A_data[Ap*m*m + tx*m + ty];
+        B_buf[tx][ty] = B_data[Bp*m*m + tx*m + ty];
 
+        __syncthreads();
         // Do the multiplication
         #pragma unroll
         for (int i=0; i<m; i++) {
-            C_buf[tx][ty] += A_buf[tx][i] * B_buf[i][ty];
-            // TODO add clipping here?
+            C_buf[tx][ty] += (uint64_t)(A_buf[tx][i] * B_buf[i][ty]);
         }
-        __syncthreads();
     }
 
     if (!multiplied) return;
@@ -76,9 +74,22 @@ void sparse_mul_cuda(uint32_t *A_data, int *A_idxs, int *A_idxptrs,
     // }
 
     // copy C_buf to C_data: each thread copies one element
-    C_valid[bx*m + by] = 1;
-    C_data[(bx*m + tx)*n + by*m + ty] = C_buf[tx][ty];
+    if (tx == 0 && ty == 0) {
+        // printf("Multiplied %d,%d\n", bx, by);
+        C_valid[bx*p + by] = 1;
+    }
     __syncthreads();
+    if (C_buf[tx][ty] >> 32) C_data[(bx*m+tx)*n + by*m + ty] = MAX;
+    else C_data[(bx*m + tx)*n + by*m + ty] = (uint32_t)C_buf[tx][ty];
+}
+
+__device__ void warpReduce(volatile int *sdata, unsigned int tid) {
+    sdata[tid] += sdata[tid + 32];
+    sdata[tid] += sdata[tid + 16];
+    sdata[tid] += sdata[tid + 8];
+    sdata[tid] += sdata[tid + 4];
+    sdata[tid] += sdata[tid + 2];
+    sdata[tid] += sdata[tid + 1];
 }
 
 __global__
@@ -96,21 +107,20 @@ void marginalize_rows(uint8_t* C_valid, int* C_rowsums, int p) {
         mergesums[tid] += (int)C_valid[rid*p + i];
         i += 256;
     }
-
     __syncthreads();
-    // now reduce mergesums
-    if (tid < 128) {
-        mergesums[tid] += mergesums[tid+128];
-        mergesums[tid] += mergesums[tid+64];
-        mergesums[tid] += mergesums[tid+32];
-        mergesums[tid] += mergesums[tid+16];
-        mergesums[tid] += mergesums[tid+8];
-        mergesums[tid] += mergesums[tid+4];
-        mergesums[tid] += mergesums[tid+2];
-        mergesums[tid] += mergesums[tid+1];
-    }
 
-    if (tid == 0) C_rowsums[rid+1] = mergesums[0];
+    // now reduce mergesums
+    if (tid < 128) mergesums[tid] += mergesums[tid+128];
+    __syncthreads();
+    if (tid < 64) mergesums[tid] += mergesums[tid+64];
+    __syncthreads();
+
+    if (tid < 32) warpReduce(mergesums, tid);
+    __syncthreads();
+
+    if (tid == 0) {
+        C_rowsums[rid+1] = mergesums[0];
+    }
 }
 
 __global__
@@ -121,15 +131,21 @@ void compress_data(uint8_t* C_valid, int* C_idxptrs, int* C_idxs,
     int tx = threadIdx.x;
     int ty = threadIdx.y;
 
-    int idx = C_idxptrs[row];
+    __shared__ int idx;
+    
+    if (tx == 0 && ty == 0) idx = C_idxptrs[row];
+    __syncthreads();
 
     for (int i=0; i<p; i++) {
         if (C_valid[p*row + i] == 1) {
             // all threads compress C_data
-            __syncthreads();
             C_bcsr_data[idx*m*m + tx*m + ty] = C_data[row*n*m + tx*n + i*m + ty];
-            C_idxs[idx-1] = i;
-            idx++;
+            __syncthreads();
+            if (tx == 0 && ty == 0) {
+                C_idxs[idx] = i;
+                idx++;
+            }
+            __syncthreads();
         }
     }
 }
@@ -178,13 +194,12 @@ BCSMatrix* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
     uint32_t* d_C_data;
     int* d_C_idxptrs;
     uint8_t*  d_C_valid;
-    uint32_t* h_C_data;
-    uint8_t*  h_C_valid;
+    //uint32_t* h_C_data;
 
 
     // create streams
-    cudaStream_t stream;
-    checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    // cudaStream_t stream;
+    // checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     // assuming A->m = B->m = m
     int p = A->p;
@@ -198,46 +213,75 @@ BCSMatrix* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_B_idxs),    sizeof(int)*B->k));
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_B_data),    sizeof(uint32_t)*B->k*B->m*B->m));
 
-    checkCudaErrors(cudaMemcpyAsync(d_A_idxptrs, A->idxptrs, sizeof(int)*(A->p+1), cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_A_idxs,    A->idxs,    sizeof(int)*A->k, cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_A_data,    A->data,    sizeof(uint32_t)*A->k*A->m*A->m, cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_B_idxptrs, B->idxptrs, sizeof(int)*(B->p+1), cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_B_idxs,    B->idxs,    sizeof(int)*B->k, cudaMemcpyHostToDevice, stream));
-    checkCudaErrors(cudaMemcpyAsync(d_B_data,    B->data,    sizeof(uint32_t)*B->k*B->m*B->m, cudaMemcpyHostToDevice, stream));
+    // checkCudaErrors(cudaMemcpyAsync(d_A_idxptrs, A->idxptrs, sizeof(int)*(A->p+1), cudaMemcpyHostToDevice, stream));
+    // checkCudaErrors(cudaMemcpyAsync(d_A_idxs,    A->idxs,    sizeof(int)*A->k, cudaMemcpyHostToDevice, stream));
+    // checkCudaErrors(cudaMemcpyAsync(d_A_data,    A->data,    sizeof(uint32_t)*A->k*A->m*A->m, cudaMemcpyHostToDevice, stream));
+    // checkCudaErrors(cudaMemcpyAsync(d_B_idxptrs, B->idxptrs, sizeof(int)*(B->p+1), cudaMemcpyHostToDevice, stream));
+    // checkCudaErrors(cudaMemcpyAsync(d_B_idxs,    B->idxs,    sizeof(int)*B->k, cudaMemcpyHostToDevice, stream));
+    // checkCudaErrors(cudaMemcpyAsync(d_B_data,    B->data,    sizeof(uint32_t)*B->k*B->m*B->m, cudaMemcpyHostToDevice, stream));
+
+    checkCudaErrors(cudaMemcpy(d_A_idxptrs, A->idxptrs, sizeof(int)*(A->p+1), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_A_idxs,    A->idxs,    sizeof(int)*A->k, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_A_data,    A->data,    sizeof(uint32_t)*A->k*A->m*A->m, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_B_idxptrs, B->idxptrs, sizeof(int)*(B->p+1), cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_B_idxs,    B->idxs,    sizeof(int)*B->k, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_B_data,    B->data,    sizeof(uint32_t)*B->k*B->m*B->m, cudaMemcpyHostToDevice));
 
     // initialize C matrix on device
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_data),  n*n*sizeof(uint32_t)));
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_valid), p*p*sizeof(uint8_t)));
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_idxptrs), (p+1)*sizeof(int)));
-    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_data),  n*n*sizeof(uint32_t)));
-    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_valid), p*p*sizeof(uint8_t)));
+    // checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_data),  n*n*sizeof(uint32_t)));
     // JUST WHILE TESTING!
-    checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_data), 0, n*n*sizeof(uint32_t)));
+    // checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_data), 0, n*n*sizeof(uint32_t)));
     checkCudaErrors(cudaMemset(reinterpret_cast<void*>(d_C_valid), 0, p*p*sizeof(uint8_t)));
 
     dim3 threads(m, m);
     dim3 grid(p, p);
 
     // checkCudaErrors(cudaStreamSynchronize(stream));
+    checkCudaErrors(cudaDeviceSynchronize());
 
     // now multiply the stuff out
     if (A->m == 4) {
-        sparse_mul_cuda<4><<<grid, threads, 0, stream>>>(
+        sparse_mul_cuda<4><<<grid, threads>>>(
             d_A_data, d_A_idxs, d_A_idxptrs, d_B_data, d_B_idxs, d_B_idxptrs,
-            d_C_data, d_C_valid, n
+            d_C_data, d_C_valid, n, p
         );
     }
     else {
-        sparse_mul_cuda<8><<<grid, threads, 0, stream>>>(
+        sparse_mul_cuda<8><<<grid, threads>>>(
             d_A_data, d_A_idxs, d_A_idxptrs, d_B_data, d_B_idxs, d_B_idxptrs,
-            d_C_data, d_C_valid, n
+            d_C_data, d_C_valid, n, p
         );
     }
+    checkCudaErrors(cudaDeviceSynchronize());
 
-    checkCudaErrors(cudaStreamSynchronize(stream));
+    // checkCudaErrors(cudaStreamSynchronize(stream));
+    // checkCudaErrors(cudaMemcpyAsync(h_C_data,  d_C_data,  n*n*sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    // checkCudaErrors(cudaStreamSynchronize(stream));
+    // for (int i=0; i<n; i++) {
+    //     for (int j=0; j<n; j++) {
+    //         std::cout << h_C_data[i*n+j] << ' ';
+    //     }
+    //     std::cout << '\n';
+    // }
+
+    // uint8_t *h_C_valid;
+    // checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_C_valid), p*p*sizeof(uint8_t)));
+    // checkCudaErrors(cudaMemcpy(h_C_valid, d_C_valid, p*p*sizeof(uint8_t), cudaMemcpyDeviceToHost));
+    // checkCudaErrors(cudaStreamSynchronize(stream));
+    // for (int i=0; i<p; i++) {
+    //     for (int j=0; j<p; j++) {
+    //         std::cout << (int)h_C_valid[i*p+j] << ' ';
+    //     }
+    //     std::cout << '\n';
+    // }
 
     // marginalize the rows out
     marginalize_rows<<<p,256>>>(d_C_valid, d_C_idxptrs, p);
+    checkCudaErrors(cudaDeviceSynchronize());
+    // checkCudaErrors(cudaStreamSynchronize(stream));
     // sum them up inplace to get the start pointers
     thrust::device_ptr<int> thrust_d_C_idxptrs(d_C_idxptrs);
     thrust::inclusive_scan(thrust_d_C_idxptrs, thrust_d_C_idxptrs+p+1, thrust_d_C_idxptrs);
@@ -258,16 +302,18 @@ BCSMatrix* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_bcsr_data), k*m*m*sizeof(uint32_t)));
     checkCudaErrors(cudaMalloc(reinterpret_cast<void**>(&d_C_idxs), k*sizeof(int)));
 
-    compress_data<<<p, threads, 0, stream>>>(d_C_valid, d_C_idxptrs, d_C_idxs, d_C_data, d_C_bcsr_data, n, m, p);
-    checkCudaErrors(cudaMemcpyAsync(C_idxs, d_C_idxs, k*sizeof(int), cudaMemcpyDeviceToHost, stream));
-    checkCudaErrors(cudaMemcpyAsync(C_bcsr_data, d_C_bcsr_data, k*m*m*sizeof(int), cudaMemcpyDeviceToHost, stream));
+    compress_data<<<p, threads>>>(d_C_valid, d_C_idxptrs, d_C_idxs, d_C_data, d_C_bcsr_data, n, m, p);
+    // checkCudaErrors(cudaStreamSynchronize(stream));
+
+    checkCudaErrors(cudaMemcpy(C_idxs, d_C_idxs, k*sizeof(int), cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(C_bcsr_data, d_C_bcsr_data, k*m*m*sizeof(int), cudaMemcpyDeviceToHost));
+    // checkCudaErrors(cudaMemcpyAsync(C_idxs, d_C_idxs, k*sizeof(int), cudaMemcpyDeviceToHost, stream));
+    // checkCudaErrors(cudaMemcpyAsync(C_bcsr_data, d_C_bcsr_data, k*m*m*sizeof(int), cudaMemcpyDeviceToHost, stream));
+    // checkCudaErrors(cudaStreamSynchronize(stream));
+    checkCudaErrors(cudaDeviceSynchronize());
 
     // TODO compress the C matrix into CSR format
     // for now, we can just copy it over
-    // checkCudaErrors(cudaMemcpyAsync(h_C_data,  d_C_data,  n*n*sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-    // checkCudaErrors(cudaMemcpyAsync(h_C_valid, d_C_valid, p*p*sizeof(uint8_t), cudaMemcpyDeviceToHost, stream));
-
-    checkCudaErrors(cudaStreamSynchronize(stream));
 
     checkCudaErrors(cudaFree(d_A_idxptrs));
     checkCudaErrors(cudaFree(d_A_idxs));
@@ -295,15 +341,20 @@ int main(int argc, char** argv) {
     BCSMatrix* A = new BCSMatrix(argv[1], CT_ROW);
     BCSMatrix* B = new BCSMatrix(argv[2], CT_COL);
 
-    //A->dense_print();
-    //std::cout << '\n';
-    //B->dense_print();
-    //std::cout << '\n';
+    // A->print();
+    // A->dense_print();
+    // std::cout << '\n';
+    // B->print();
+    // B->dense_print();
+    // std::cout << '\n';
 
     BCSMatrix *C = sparse_matrix_multiply(A, B);
 
-    //C->dense_print();
-    //std::cout << '\n';
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    // C->print();
+    // C->dense_print();
+    // std::cout << '\n';
 
     C->save(argv[3]);
 

@@ -31,7 +31,8 @@ with open(args.output, "wb") as file:
     file.write(m.to_bytes(length=4, byteorder="little"))
     file.write(k.to_bytes(length=4, byteorder="little"))
     for row, col in non_zero_coordinates:
-        block = np.random.uniform(low=0, high=2**11, size=(m, m)).astype("<u2")
+        block = np.random.uniform(low=0, high=2**10, size=(m, m)).astype("<u2")
+        # block = np.full((m,m), 2**16-1, dtype='<u2')
         file.write(row.to_bytes(length=4, byteorder="little"))
         file.write(col.to_bytes(length=4, byteorder="little"))
         file.write(block.tobytes())

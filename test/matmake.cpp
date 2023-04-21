@@ -19,7 +19,6 @@ int main(int argc, char** argv) {
     
     SparseMatrix *mat = new SparseMatrix(n, m, k);
     int u = n/m;
-    int nb = u*(u+1)/2;
 
     std::random_device dev;
     std::mt19937 rng(dev());
@@ -33,11 +32,12 @@ int main(int argc, char** argv) {
     #pragma omp parallel
     #pragma omp single
     for (int i=0; i<k; i++) {
-
-        int r = row(rng);
-        int c = col(rng);
-        int hc = hashcoord(r,c);
-        if (populated.find(hc) != populated.end()) continue;
+        int r, c, hc;
+        do {
+            r = row(rng);
+            c = col(rng);
+            hc = hashcoord(r,c);
+        } while (populated.find(hc) != populated.end());
         populated.insert(hc);
         #pragma omp task
         {

@@ -170,9 +170,15 @@ void BCSMatrix::save(char* filename) {
 
     for (int r=0; r<p; r++) {
         for (int cp=idxptrs[r]; cp<idxptrs[r+1]; cp++) {
-            output.write((char*)&r, 4);
-            output.write((char*)&idxs[cp], 4);
-            output.write((char*)&data[cp], 4*m*m);
+            if (ct == CT_ROW) {
+                output.write((char*)&r, 4);
+                output.write((char*)&idxs[cp], 4);
+            }
+            else {
+                output.write((char*)&idxs[cp], 4);
+                output.write((char*)&r, 4);
+            }
+            output.write((char*)&data[cp*m*m], 4*m*m);
         }
     }
 }
