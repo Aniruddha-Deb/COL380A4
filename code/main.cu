@@ -257,6 +257,13 @@ BCSMatrix* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
     }
     checkCudaErrors(cudaDeviceSynchronize());
 
+    checkCudaErrors(cudaFree(d_A_idxptrs));
+    checkCudaErrors(cudaFree(d_A_idxs));
+    checkCudaErrors(cudaFree(d_A_data));
+    checkCudaErrors(cudaFree(d_B_idxptrs));
+    checkCudaErrors(cudaFree(d_B_idxs));
+    checkCudaErrors(cudaFree(d_B_data));
+
     // checkCudaErrors(cudaStreamSynchronize(stream));
     // checkCudaErrors(cudaMemcpyAsync(h_C_data,  d_C_data,  n*n*sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
     // checkCudaErrors(cudaStreamSynchronize(stream));
@@ -315,12 +322,6 @@ BCSMatrix* sparse_matrix_multiply(BCSMatrix *A, BCSMatrix *B) {
     // TODO compress the C matrix into CSR format
     // for now, we can just copy it over
 
-    checkCudaErrors(cudaFree(d_A_idxptrs));
-    checkCudaErrors(cudaFree(d_A_idxs));
-    checkCudaErrors(cudaFree(d_A_data));
-    checkCudaErrors(cudaFree(d_B_idxptrs));
-    checkCudaErrors(cudaFree(d_B_idxs));
-    checkCudaErrors(cudaFree(d_B_data));
     checkCudaErrors(cudaFree(d_C_idxptrs));
     checkCudaErrors(cudaFree(d_C_idxs));
     checkCudaErrors(cudaFree(d_C_data));

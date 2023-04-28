@@ -1,7 +1,8 @@
 """Generate random block matrices."""
 from argparse import ArgumentParser
-from random import sample
+from random import sample, shuffle
 import numpy as np
+from tqdm.auto import tqdm
 
 parser = ArgumentParser()
 parser.add_argument("-n", type=int, required=True, help="Matrix size. n for an nxn matrix.")
@@ -19,18 +20,19 @@ assert k <= (n // m)**2, \
     f"#Non-zero blocks supplied ({k}) is more than the maximum possible number ({(n // m)**2})."
 
 # Choose coordinates for non-overlapping blocks.
-coordinates = list()
-for row in range(0, n, m):
-    for col in range(0, n, m):
-        coordinates.append((row // m, col // m))
-non_zero_coordinates = sample(coordinates, k=k)
+coordinates = [(row // m, col // m) for col in range(0, n, m) for row in range(0, n, m)]
+
+print('Sampling coordinates...')
+shuffle(coordinates)
+non_zero_coordinates = coordinates[:k]
+print('Sampled coordinates')
 
 # choose whether to place a non zero block or not.
 with open(args.output, "wb") as file:
     file.write(n.to_bytes(length=4, byteorder="little"))
     file.write(m.to_bytes(length=4, byteorder="little"))
     file.write(k.to_bytes(length=4, byteorder="little"))
-    for row, col in non_zero_coordinates:
+    for row, col in tqdm(non_zero_coordinates):
         block = np.random.uniform(low=0, high=2**10, size=(m, m)).astype("<u2")
         # block = np.full((m,m), 2**16-1, dtype='<u2')
         file.write(row.to_bytes(length=4, byteorder="little"))
